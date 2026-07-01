@@ -73,8 +73,12 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
         config,
         num_init_worker=128,
     ):
+        if hasattr(config, 'dataset_init_worker'):
+            num_init_worker = config.dataset_init_worker
+        elif hasattr(config, 'load_worker'):
+            num_init_worker = min(num_init_worker, max(1, int(config.load_worker)))
         self._datasets = construct_lerobot_multi_processor(config, 
-                                                           num_init_worker, 
+                                                           max(1, int(num_init_worker)),
                                                            )
         self.item_id_to_dataset_id, self.acc_dset_num = (
             self._get_item_id_to_dataset_id()
@@ -146,11 +150,12 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.config = config
         self.cfg_prob = config.cfg_prob
         self.used_video_keys = config.obs_cam_keys
+        self.action_key = getattr(config, 'action_key', 'action')
         self.q01 = np.array(config.norm_stat['q01'], dtype='float')[None]
         self.q99 = np.array(config.norm_stat['q99'], dtype='float')[None]
         self._hf_torch_view = self.hf_dataset.with_format(
                 type='torch',
-                columns=['action'],
+                columns=[self.action_key],
                 output_all_columns=False
             )
         self.parse_meta()
@@ -303,7 +308,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         ori_data_dict.update(hf_data_frames)
         out_dict = self._cat_video_latents(ori_data_dict)
 
-        out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action'])
+        out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict[self.action_key])
 
         out_dict['latents'] = out_dict['latents'].permute(3, 0, 1, 2)
         return out_dict

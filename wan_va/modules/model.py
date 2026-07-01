@@ -28,8 +28,14 @@ from functools import partial
 
 try:
     from flash_attn_interface import flash_attn_func
-except:
-    from flash_attn import flash_attn_func
+    FLASH_ATTN_IMPORT_ERROR = None
+except Exception as exc:
+    try:
+        from flash_attn import flash_attn_func
+        FLASH_ATTN_IMPORT_ERROR = None
+    except Exception as inner_exc:
+        flash_attn_func = None
+        FLASH_ATTN_IMPORT_ERROR = inner_exc
 
 __all__ = ['WanTransformer3DModel']
 
@@ -302,7 +308,10 @@ class WanAttention(torch.nn.Module):
         if attn_mode == 'torch':
             self.attn_op = custom_sdpa
         elif attn_mode == 'flashattn':
-            self.attn_op = flash_attn_func
+            if flash_attn_func is None:
+                self.attn_op = custom_sdpa
+            else:
+                self.attn_op = flash_attn_func
         elif attn_mode == 'flex':
             self.attn_op = FlexAttnFunc(cross_attention_dim_head is not None)
         else:

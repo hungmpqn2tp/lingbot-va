@@ -43,8 +43,9 @@ huggingface = "https://github.com/Robbyant"
 modelscope = "https://github.com/Robbyant"
 discord = "https://github.com/Robbyant"
 
-[tool.setuptools]
-packages = ["lingbot_va"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["wan_va*"]
 
 [tool.setuptools.package-data]
 "lingbot_va" = ["**/*.py"]

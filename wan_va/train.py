@@ -33,6 +33,13 @@ from einops import rearrange
 from modules.utils import (
     load_transformer,
 )
+from modules.lora import (
+    count_trainable_parameters,
+    inject_lora,
+    mark_only_lora_as_trainable,
+    merged_lora_state_dict,
+    save_lora_checkpoint,
+)
 from utils import (
     init_logger, 
     logger, 
@@ -88,6 +95,34 @@ class Trainer:
             attn_mode="flex"
         )
 
+        self.train_mode = getattr(config, 'train_mode', 'full').lower()
+        self.lora_matched_modules = []
+        if self.train_mode == 'lora':
+            target_modules = list(getattr(config, 'lora_target_modules', []))
+            self.transformer.requires_grad_(False)
+            self.lora_matched_modules = inject_lora(
+                self.transformer,
+                target_modules,
+                rank=getattr(config, 'lora_rank', 16),
+                alpha=getattr(config, 'lora_alpha', 32.0),
+                dropout=getattr(config, 'lora_dropout', 0.0),
+            )
+            mark_only_lora_as_trainable(self.transformer)
+            logger.info(
+                f"LoRA enabled: rank={config.lora_rank}, alpha={config.lora_alpha}, "
+                f"matched_modules={len(self.lora_matched_modules)}"
+            )
+        elif self.train_mode == 'full':
+            self.transformer.requires_grad_(True)
+        else:
+            raise ValueError(f"Unknown train_mode: {self.train_mode}")
+
+        trainable, total = count_trainable_parameters(self.transformer)
+        logger.info(
+            f"Train mode: {self.train_mode}; trainable parameters: "
+            f"{trainable:,} / {total:,} ({trainable / max(total, 1):.4%})"
+        )
+
         logger.info("Setting up activation checkpointing ...")
         apply_ac(self.transformer)
 
@@ -101,7 +136,10 @@ class Trainer:
             eval_mode=False,
         )
         self.transformer.train()
-        self.transformer.requires_grad_(True)
+        if self.train_mode == 'full':
+            self.transformer.requires_grad_(True)
+        else:
+            mark_only_lora_as_trainable(self.transformer)
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -346,6 +384,40 @@ class Trainer:
                 checkpoint_dir = self.save_dir / f"checkpoint_step_{self.step}"
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+                if self.train_mode == 'lora':
+                    adapter_dir = checkpoint_dir / "lora_adapter"
+                    logger.info(f"Saving LoRA adapter to {adapter_dir}")
+                    save_lora_checkpoint(
+                        state_dict_bf16,
+                        adapter_dir,
+                        self.config,
+                        getattr(self.config, 'lora_target_modules', []),
+                        self.lora_matched_modules,
+                    )
+                    if getattr(self.config, 'lora_save_merged', False):
+                        transformer_dir = checkpoint_dir / "transformer"
+                        transformer_dir.mkdir(parents=True, exist_ok=True)
+                        alpha_by_prefix = {
+                            name: float(getattr(self.config, 'lora_alpha', 32.0))
+                            for name in self.lora_matched_modules
+                        }
+                        merged_state = merged_lora_state_dict(
+                            state_dict_bf16,
+                            alpha_by_prefix=alpha_by_prefix,
+                        )
+                        save_file(
+                            merged_state,
+                            transformer_dir / "diffusion_pytorch_model.safetensors",
+                        )
+                        config_dict = dict(self.transformer.config)
+                        config_dict.pop('_name_or_path', None)
+                        with open(transformer_dir / "config.json", 'w') as f:
+                            json.dump(config_dict, f, indent=2)
+                    logger.info(f"LoRA checkpoint saved successfully at step {self.step}")
+                    if dist.is_initialized():
+                        dist.barrier()
+                    return
+
                 # Save transformer in the same format as pretrained model
                 transformer_dir = checkpoint_dir / "transformer"
                 transformer_dir.mkdir(parents=True, exist_ok=True)
@@ -503,6 +575,80 @@ class Trainer:
         logger.info("Training completed!")
 
 
+def _norm_stat_from_payload(payload, config):
+    if "model_q01" in payload and "model_q99" in payload:
+        return {"q01": payload["model_q01"], "q99": payload["model_q99"]}
+    if "q01" in payload and "q99" in payload and len(payload["q01"]) == config.action_dim:
+        return {"q01": payload["q01"], "q99": payload["q99"]}
+    if "action_q01" in payload and "action_q99" in payload:
+        q01 = [0.0] * config.action_dim
+        q99 = [1.0] * config.action_dim
+        for source_idx, model_channel in enumerate(config.used_action_channel_ids):
+            q01[model_channel] = float(payload["action_q01"][source_idx])
+            q99[model_channel] = float(payload["action_q99"][source_idx])
+        return {"q01": q01, "q99": q99}
+    raise ValueError("Norm stat file must contain model_q01/model_q99 or action_q01/action_q99")
+
+
+def _maybe_load_norm_stat(config, explicit_path=None):
+    candidate = explicit_path
+    if candidate is None and hasattr(config, "dataset_path"):
+        candidate = os.path.join(config.dataset_path, "meta", "lingbot_va_robomme_norm_stats.json")
+    if candidate is None or not os.path.exists(candidate):
+        return
+    with open(candidate, "r") as f:
+        config.norm_stat = _norm_stat_from_payload(json.load(f), config)
+    logger.info(f"Loaded action normalization stats from {candidate}")
+
+
+def _apply_cli_overrides(config, args):
+    if args.save_root is not None:
+        config.save_root = args.save_root
+    if args.dataset_path is not None:
+        config.dataset_path = args.dataset_path
+        empty_emb_path = getattr(config, "empty_emb_path", None)
+        if empty_emb_path is None or str(empty_emb_path).startswith("/path/to/"):
+            config.empty_emb_path = os.path.join(config.dataset_path, "empty_emb.pt")
+    if args.empty_emb_path is not None:
+        config.empty_emb_path = args.empty_emb_path
+    if args.pretrained_model is not None:
+        config.wan22_pretrained_model_name_or_path = args.pretrained_model
+    if args.resume_from is not None:
+        config.resume_from = args.resume_from
+    if args.train_mode is not None:
+        config.train_mode = args.train_mode
+    if args.num_steps is not None:
+        config.num_steps = args.num_steps
+    if args.batch_size is not None:
+        config.batch_size = args.batch_size
+    if args.gradient_accumulation_steps is not None:
+        config.gradient_accumulation_steps = args.gradient_accumulation_steps
+    if args.learning_rate is not None:
+        config.learning_rate = args.learning_rate
+    if args.save_interval is not None:
+        config.save_interval = args.save_interval
+    if args.load_worker is not None:
+        config.load_worker = args.load_worker
+    if args.enable_wandb:
+        config.enable_wandb = True
+    if args.disable_wandb:
+        config.enable_wandb = False
+    if args.lora_rank is not None:
+        config.lora_rank = args.lora_rank
+    if args.lora_alpha is not None:
+        config.lora_alpha = args.lora_alpha
+    if args.lora_dropout is not None:
+        config.lora_dropout = args.lora_dropout
+    if args.lora_target_modules is not None:
+        config.lora_target_modules = [
+            item.strip() for item in args.lora_target_modules.split(",") if item.strip()
+        ]
+    if args.lora_save_merged:
+        config.lora_save_merged = True
+
+    _maybe_load_norm_stat(config, args.norm_stat_path)
+
+
 def run(args):
     """Main entry point."""
     config = VA_CONFIGS[args.config_name]
@@ -517,8 +663,7 @@ def run(args):
     config.local_rank = local_rank
     config.world_size = world_size
 
-    if args.save_root is not None:
-        config.save_root = args.save_root
+    _apply_cli_overrides(config, args)
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
@@ -543,6 +688,30 @@ def main():
         default=None,
         help="Root directory for saving checkpoints",
     )
+    parser.add_argument("--dataset-path", type=str, default=None)
+    parser.add_argument("--empty-emb-path", type=str, default=None)
+    parser.add_argument("--pretrained-model", type=str, default=None)
+    parser.add_argument("--resume-from", type=str, default=None)
+    parser.add_argument("--norm-stat-path", type=str, default=None)
+    parser.add_argument("--train-mode", choices=["full", "lora"], default=None)
+    parser.add_argument("--num-steps", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--save-interval", type=int, default=None)
+    parser.add_argument("--load-worker", type=int, default=None)
+    parser.add_argument("--enable-wandb", action="store_true")
+    parser.add_argument("--disable-wandb", action="store_true")
+    parser.add_argument("--lora-rank", type=int, default=None)
+    parser.add_argument("--lora-alpha", type=float, default=None)
+    parser.add_argument("--lora-dropout", type=float, default=None)
+    parser.add_argument(
+        "--lora-target-modules",
+        type=str,
+        default=None,
+        help="Comma-separated fnmatch patterns for Linear modules",
+    )
+    parser.add_argument("--lora-save-merged", action="store_true")
 
     args = parser.parse_args()
     run(args)
