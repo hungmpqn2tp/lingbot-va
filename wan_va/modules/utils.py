@@ -44,6 +44,7 @@ def load_transformer(
     torch_device,
     **kwargs
 ):
+    kwargs.setdefault("low_cpu_mem_usage", True)
     model = WanTransformer3DModel.from_pretrained(
         transformer_path,
         torch_dtype=torch_dtype,
