@@ -1,7 +1,9 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+import math
 import os
 import sys
+from copy import deepcopy
 from pathlib import Path
 import wandb
 
@@ -22,6 +24,7 @@ import json
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from configs import VA_CONFIGS
+from configs.va_robomme_cfg import load_robomme_norm_stat
 from distributed.fsdp import shard_model, apply_ac
 from distributed.util import (
     _configure_model, 
@@ -272,6 +275,19 @@ class Trainer:
             action_mask=batch_dict['actions_mask'], 
             action_mode=True,
             noisy_cond_prob=0.0)
+        if getattr(self.config, "initial_action_condition", None) == "model_zero":
+            first_mask = batch_dict["actions_mask"][:, :, 0]
+            if torch.any(first_mask):
+                raise ValueError(
+                    "RoboMME F0 must be masked as a non-target action condition"
+                )
+            # Inference clamps this non-executed token to normalized zero at
+            # timestep zero. Keep the training token identical after noising.
+            action_dict["noisy_latents"][:, :, 0] = 0
+            action_dict["latent"][:, :, 0] = 0
+            action_dict["targets"][:, :, 0] = 0
+            action_dict["timesteps"][:, 0] = 0
+            action_dict["cond_timesteps"][:, 0] = 0
 
         latent_dict['text_emb'] = batch_dict['text_emb']
         action_dict['text_emb'] = batch_dict['text_emb']
@@ -328,7 +344,13 @@ class Trainer:
         # Sum per frame and normalize by mask per frame
         action_loss_per_frame = action_loss.sum(dim=1)  # (B*F,)
         action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
-        action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
+        valid_action_frames = action_mask_per_frame > 0
+        if not torch.any(valid_action_frames):
+            raise ValueError("Batch has no valid action target frames")
+        action_loss = (
+            action_loss_per_frame[valid_action_frames]
+            / action_mask_per_frame[valid_action_frames]
+        ).mean()
 
         return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps
 
@@ -369,9 +391,20 @@ class Trainer:
     def save_checkpoint(self,):
         """Save model checkpoint in the same format as pretrained model."""
         try:
+            # For the normal LoRA path, exclude every frozen base parameter
+            # before FSDP gathers a full state dict. This keeps checkpointing
+            # proportional to adapter size rather than the ~10 GiB base model.
+            adapter_only = (
+                self.train_mode == "lora"
+                and not getattr(self.config, "lora_save_merged", False)
+            )
             state_dict = get_model_state_dict(
                 self.transformer,
-                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+                options=StateDictOptions(
+                    full_state_dict=True,
+                    cpu_offload=True,
+                    ignore_frozen_params=adapter_only,
+                ),
             )
             state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
             # optim_state = get_optimizer_state_dict(
@@ -459,6 +492,7 @@ class Trainer:
             # Ensure all processes stay synchronized even on error
             if dist.is_initialized():
                 dist.barrier()
+            raise
 
     def _load_training_state(self, checkpoint_path):
         """Load training state (optimizer + step) after FSDP and optimizer creation."""
@@ -590,14 +624,28 @@ def _norm_stat_from_payload(payload, config):
     raise ValueError("Norm stat file must contain model_q01/model_q99 or action_q01/action_q99")
 
 
-def _maybe_load_norm_stat(config, explicit_path=None):
+def _maybe_load_norm_stat(config, explicit_path=None, required=False):
     candidate = explicit_path
     if candidate is None and hasattr(config, "dataset_path"):
         candidate = os.path.join(config.dataset_path, "meta", "lingbot_va_robomme_norm_stats.json")
-    if candidate is None or not os.path.exists(candidate):
+    if candidate is None:
+        if required:
+            raise ValueError(
+                "RoboMME training requires --norm-stat-path or a dataset-path "
+                "containing meta/lingbot_va_robomme_norm_stats.json"
+            )
         return
-    with open(candidate, "r") as f:
-        config.norm_stat = _norm_stat_from_payload(json.load(f), config)
+    candidate = os.path.abspath(os.path.expanduser(candidate))
+    if not os.path.isfile(candidate):
+        if explicit_path is not None or required:
+            raise FileNotFoundError(f"Missing action normalization stats: {candidate}")
+        return
+    if required:
+        config.norm_stat = load_robomme_norm_stat(candidate)
+    else:
+        with open(candidate, "r") as f:
+            config.norm_stat = _norm_stat_from_payload(json.load(f), config)
+    config.norm_stat_path = candidate
     logger.info(f"Loaded action normalization stats from {candidate}")
 
 
@@ -646,12 +694,30 @@ def _apply_cli_overrides(config, args):
     if args.lora_save_merged:
         config.lora_save_merged = True
 
-    _maybe_load_norm_stat(config, args.norm_stat_path)
+    _maybe_load_norm_stat(
+        config,
+        args.norm_stat_path,
+        required=args.config_name == "robomme_train",
+    )
+
+    if str(getattr(config, "train_mode", "full")).lower() == "lora":
+        if getattr(config, "resume_from", None):
+            raise ValueError(
+                "LoRA --resume-from is not supported by this checkpoint format; "
+                "start a new run from --pretrained-model"
+            )
+        if int(config.lora_rank) <= 0:
+            raise ValueError("LoRA rank must be positive")
+        if not math.isfinite(float(config.lora_alpha)) or float(config.lora_alpha) <= 0:
+            raise ValueError("LoRA alpha must be finite and positive")
+        if not 0.0 <= float(config.lora_dropout) < 1.0:
+            raise ValueError("LoRA dropout must be in [0, 1)")
 
 
 def run(args):
     """Main entry point."""
-    config = VA_CONFIGS[args.config_name]
+    config = deepcopy(VA_CONFIGS[args.config_name])
+    _apply_cli_overrides(config, args)
 
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
@@ -662,8 +728,6 @@ def run(args):
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size
-
-    _apply_cli_overrides(config, args)
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")

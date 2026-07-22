@@ -99,6 +99,164 @@ def count_trainable_parameters(model):
     return trainable, total
 
 
+def resolve_lora_adapter_dir(path):
+    path = Path(path).expanduser().resolve()
+    for candidate in (path, path / "lora_adapter"):
+        if (
+            (candidate / "adapter_config.json").is_file()
+            and (candidate / "adapter_model.safetensors").is_file()
+        ):
+            return candidate
+    raise FileNotFoundError(
+        "Could not find adapter_config.json and adapter_model.safetensors in "
+        f"{path} or {path / 'lora_adapter'}"
+    )
+
+
+@torch.no_grad()
+def merge_lora_adapter_into_model(model, adapter_path):
+    """Merge a native LingBot-VA LoRA checkpoint into an unsharded model."""
+    from safetensors.torch import load_file
+
+    if getattr(model, "_lingbot_lora_merged", False):
+        raise RuntimeError("A LoRA adapter has already been merged into this model")
+
+    adapter_dir = resolve_lora_adapter_dir(adapter_path)
+    with open(adapter_dir / "adapter_config.json", "r") as f:
+        adapter_config = json.load(f)
+
+    if adapter_config.get("format") != "lingbot-va-lora":
+        raise ValueError(
+            f"Unsupported LoRA format in {adapter_dir}: "
+            f"{adapter_config.get('format')!r}"
+        )
+
+    adapter_state = load_file(
+        adapter_dir / "adapter_model.safetensors",
+        device="cpu",
+    )
+    base_model_name_or_path = adapter_config.get("base_model_name_or_path")
+    if not isinstance(base_model_name_or_path, str) or not base_model_name_or_path:
+        raise ValueError(
+            f"LoRA adapter in {adapter_dir} has no base_model_name_or_path"
+        )
+    configured_modules = adapter_config.get("matched_modules")
+    if not isinstance(configured_modules, list) or not configured_modules:
+        raise ValueError(
+            f"LoRA matched_modules in {adapter_dir} must be a non-empty list"
+        )
+    matched_modules = list(configured_modules)
+    target_patterns = adapter_config.get("target_modules")
+    if (
+        not isinstance(target_patterns, list)
+        or not target_patterns
+        or any(not isinstance(pattern, str) or not pattern for pattern in target_patterns)
+    ):
+        raise ValueError(
+            f"LoRA target_modules in {adapter_dir} must be a non-empty string list"
+        )
+
+    expected_keys = {
+        key
+        for name in matched_modules
+        for key in (f"{name}.lora_A.weight", f"{name}.lora_B.weight")
+    }
+    actual_keys = set(adapter_state)
+    if actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        unexpected = sorted(actual_keys - expected_keys)
+        raise ValueError(
+            "LoRA adapter state is incomplete or contains unexpected tensors. "
+            f"Missing={missing[:10]}, unexpected={unexpected[:10]}"
+        )
+
+    modules = dict(model.named_modules())
+    expanded_targets = sorted(
+        name
+        for name, module in modules.items()
+        if name and isinstance(module, nn.Linear) and _matches(name, target_patterns)
+    )
+    if set(expanded_targets) != set(matched_modules):
+        missing = sorted(set(expanded_targets) - set(matched_modules))
+        unexpected = sorted(set(matched_modules) - set(expanded_targets))
+        raise ValueError(
+            "LoRA adapter does not cover exactly the configured base targets. "
+            f"Missing={missing[:10]}, unexpected={unexpected[:10]}"
+        )
+    try:
+        alpha = float(adapter_config["alpha"])
+        configured_rank = int(adapter_config["rank"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid LoRA rank/alpha in {adapter_dir}") from exc
+    if configured_rank <= 0 or not math.isfinite(alpha) or alpha <= 0:
+        raise ValueError(
+            f"LoRA rank and alpha must be positive and alpha finite, got "
+            f"rank={configured_rank}, alpha={alpha}"
+        )
+    if any(not isinstance(name, str) or not name for name in matched_modules):
+        raise ValueError("LoRA matched_modules must contain non-empty strings")
+    if len(set(matched_modules)) != len(matched_modules):
+        raise ValueError("LoRA matched_modules contains duplicate entries")
+
+    # Validate the entire adapter before changing any base-model weight. This
+    # prevents a malformed late tensor from leaving a partially merged model.
+    merge_plan = []
+    for name in matched_modules:
+        module = modules.get(name)
+        if not isinstance(module, nn.Linear):
+            raise ValueError(
+                f"LoRA target {name!r} is missing or is not nn.Linear in the base model"
+            )
+
+        a_weight = adapter_state[f"{name}.lora_A.weight"]
+        b_weight = adapter_state[f"{name}.lora_B.weight"]
+        if a_weight.ndim != 2 or b_weight.ndim != 2:
+            raise ValueError(
+                f"LoRA tensors for {name} must be matrices, got "
+                f"A={tuple(a_weight.shape)}, B={tuple(b_weight.shape)}"
+            )
+        if not torch.isfinite(a_weight).all() or not torch.isfinite(b_weight).all():
+            raise ValueError(f"LoRA tensors for {name} contain non-finite values")
+        rank = int(a_weight.shape[0])
+        if rank != configured_rank or b_weight.shape[1] != rank:
+            raise ValueError(
+                f"LoRA rank mismatch for {name}: config={configured_rank}, "
+                f"A={tuple(a_weight.shape)}, B={tuple(b_weight.shape)}"
+            )
+        if a_weight.shape[1] != module.in_features or b_weight.shape[0] != module.out_features:
+            raise ValueError(
+                f"LoRA/base shape mismatch for {name}: A={tuple(a_weight.shape)}, "
+                f"B={tuple(b_weight.shape)}, base={tuple(module.weight.shape)}"
+            )
+
+        merge_plan.append((module, a_weight, b_weight))
+
+    scale = alpha / configured_rank
+    delta_l2 = 0.0
+    for module, a_weight, b_weight in merge_plan:
+        device = module.weight.device
+        delta = b_weight.to(device=device, dtype=torch.float32) @ a_weight.to(
+            device=device,
+            dtype=torch.float32,
+        )
+        scaled_delta = delta * scale
+        merged = module.weight.detach().float() + scaled_delta
+        module.weight.copy_(merged.to(dtype=module.weight.dtype))
+        delta_l2 += scaled_delta.square().sum().item()
+
+    model._lingbot_lora_merged = True
+
+    return {
+        "adapter_dir": str(adapter_dir),
+        "rank": configured_rank,
+        "alpha": alpha,
+        "scale": scale,
+        "delta_l2": math.sqrt(delta_l2),
+        "base_model_name_or_path": base_model_name_or_path,
+        "matched_modules": matched_modules,
+    }
+
+
 def lora_state_dict(full_state_dict):
     return {
         key: value
@@ -150,6 +308,25 @@ def save_lora_checkpoint(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     adapter_state = lora_state_dict(full_state_dict)
+    expected_keys = {
+        key
+        for name in matched_modules
+        for key in (f"{name}.lora_A.weight", f"{name}.lora_B.weight")
+    }
+    if set(adapter_state) != expected_keys:
+        missing = sorted(expected_keys - set(adapter_state))
+        unexpected = sorted(set(adapter_state) - expected_keys)
+        raise ValueError(
+            "Gathered LoRA state does not match injected modules. "
+            f"Missing={missing[:10]}, unexpected={unexpected[:10]}"
+        )
+    nonfinite = [
+        key
+        for key, value in adapter_state.items()
+        if not torch.isfinite(value).all()
+    ]
+    if nonfinite:
+        raise ValueError(f"Cannot save non-finite LoRA tensors: {nonfinite[:10]}")
     save_file(adapter_state, output_dir / "adapter_model.safetensors")
     adapter_config = {
         "format": "lingbot-va-lora",

@@ -3,6 +3,7 @@ import argparse
 import os
 import sys
 import time
+from copy import deepcopy
 from functools import partial
 from PIL import Image
 from diffusers.video_processor import VideoProcessor
@@ -18,8 +19,16 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from configs import VA_CONFIGS
+from configs.va_robomme_cfg import (
+    load_robomme_norm_stat,
+    validate_robomme_norm_stat,
+)
 from distributed.fsdp import shard_model
 from distributed.util import _configure_model, init_distributed
+from modules.lora import (
+    merge_lora_adapter_into_model,
+    resolve_lora_adapter_dir,
+)
 from modules.utils import (
     WanVAEStreamingWrapper,
     load_text_encoder,
@@ -47,6 +56,10 @@ class VA_Server:
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
+        self.save_debug_artifacts = job_config.local_rank == 0 and bool(
+            getattr(job_config, "save_debug_artifacts", False)
+        )
+        self.session_initialized = False
 
         self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
                                             sigma_min=0.0,
@@ -84,6 +97,25 @@ class VA_Server:
             torch_device=self.device,
             attn_mode="torch"
         )
+        adapter_path = getattr(job_config, "lora_adapter_path", None)
+        if adapter_path:
+            merge_info = merge_lora_adapter_into_model(
+                self.transformer,
+                adapter_path,
+            )
+            logger.info(
+                "Merged LoRA adapter before FSDP: "
+                f"path={merge_info['adapter_dir']}, "
+                f"declared_base={merge_info['base_model_name_or_path']}, "
+                f"modules={len(merge_info['matched_modules'])}, "
+                f"rank={merge_info['rank']}, alpha={merge_info['alpha']}, "
+                f"scale={merge_info['scale']}, delta_l2={merge_info['delta_l2']:.6g}"
+            )
+        elif getattr(job_config, "require_lora", False):
+            raise ValueError(
+                "LoRA is required but no adapter was provided. Use "
+                "--lora-adapter or set LINGBOT_LORA_ADAPTER."
+            )
         shard_fn = shard_model
         self.transformer = _configure_model(model=self.transformer,
                                             shard_fn=shard_fn,
@@ -222,8 +254,21 @@ class VA_Server:
         return latents
 
     def preprocess_action(self, action):
-        action_model_input = torch.from_numpy(action)
+        action = np.asarray(action)
+        if action.ndim != 3:
+            raise ValueError(
+                f"Cached action state must have shape [C, F, H], got {action.shape}"
+            )
+        if not np.isfinite(action).all():
+            raise ValueError("Cached action state contains non-finite values")
+        action_model_input = torch.from_numpy(action).float()
         CA, FA, HA = action_model_input.shape  # C, F, H
+        if CA != self.job_config.action_source_dim or HA != self.action_per_frame:
+            raise ValueError(
+                "Cached action state shape mismatch: expected "
+                f"[{self.job_config.action_source_dim}, F, {self.action_per_frame}], "
+                f"got {tuple(action_model_input.shape)}"
+            )
         action_model_input_paded = F.pad(action_model_input,
                                          [0, 0, 0, 0, 0, 1],
                                          mode='constant',
@@ -235,6 +280,7 @@ class VA_Server:
         if self.action_norm_method == 'quantiles':
             action_model_input = (action_model_input - self.actions_q01) / (
                 self.actions_q99 - self.actions_q01 + 1e-6) * 2. - 1.
+            action_model_input = torch.clamp(action_model_input, -1.5, 1.5)
         else:
             raise NotImplementedError
         return action_model_input.unsqueeze(0).unsqueeze(-1)  # B, C, F, H, W
@@ -376,6 +422,7 @@ class VA_Server:
 
     def _reset(self, prompt=None):
         logger.info('Reset.')
+        self.session_initialized = True
         self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
         #### Reset all parameters
         self.frame_st_id = 0
@@ -440,10 +487,31 @@ class VA_Server:
         os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
 
+    def _prime(self, obs):
+        """Encode exactly one initial observation without running diffusion."""
+        if self.frame_st_id != 0 or self.init_latent is not None:
+            raise RuntimeError("Prime is only valid once, immediately after reset")
+        images = obs.get("obs")
+        image_count = len(images) if isinstance(images, list) else 1
+        if images is None or image_count != 1:
+            raise ValueError(
+                f"Prime expects exactly one observation, got {image_count}"
+            )
+        init_latent = self._encode_obs(obs)
+        if init_latent is None or init_latent.shape[2] != 1:
+            shape = None if init_latent is None else tuple(init_latent.shape)
+            raise ValueError(
+                f"Prime must produce exactly one video latent, got {shape}"
+            )
+        self.init_latent = init_latent
+        logger.info(f"Primed initial observation latent: {tuple(init_latent.shape)}")
+
     def _infer(self, obs, frame_st_id=0):
         frame_chunk_size = self.job_config.frame_chunk_size
         if frame_st_id == 0:
-            init_latent = self._encode_obs(obs)
+            init_latent = self.init_latent
+            if init_latent is None:
+                init_latent = self._encode_obs(obs)
             self.init_latent = init_latent
 
         latents = torch.randn(1,
@@ -523,6 +591,8 @@ class VA_Server:
 
             for i, t in enumerate(tqdm(action_timesteps)):
                 last_step = i == len(action_timesteps) - 1
+                # F0 is a non-executed, normalized/model-space zero condition.
+                # The RoboMME training path locks and masks the same token.
                 action_cond = torch.zeros(
                     [
                         1, self.job_config.action_dim, 1,
@@ -562,24 +632,72 @@ class VA_Server:
 
         actions[:, ~self.action_mask] *= 0
 
-        save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
-        save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
+        if self.save_debug_artifacts:
+            save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
+            save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
 
         actions = self.postprocess_action(actions)
         torch.cuda.empty_cache()
         return actions, latents
 
     def _compute_kv_cache(self, obs):
-        ### optional async save obs for debug
-        self.transformer.clear_pred_cache(self.cache_name)
-        save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
+        images = obs.get("obs")
+        if not isinstance(images, list) or not images or len(images) % 4:
+            count = len(images) if isinstance(images, list) else None
+            raise ValueError(
+                "KV-cache observations must be a non-empty list whose raw "
+                f"length is divisible by four, got {count}"
+            )
+        if self.frame_st_id == 0:
+            if self.init_latent is None:
+                raise RuntimeError(
+                    "Initial KV-cache update requires an initial latent; call "
+                    "normal inference or prime first"
+                )
+
+        action_model_input = self.preprocess_action(obs['state'])
+        prepend_initial_action = bool(obs.get("prepend_initial_action", False))
+        if prepend_initial_action:
+            if self.frame_st_id != 0:
+                raise ValueError(
+                    "prepend_initial_action is only valid for the first cache update"
+                )
+            action_model_input = torch.cat(
+                [torch.zeros_like(action_model_input[:, :, :1]), action_model_input],
+                dim=2,
+            )
+        expected_video_frames = len(images) // 4 + int(self.frame_st_id == 0)
+        if action_model_input.shape[2] != expected_video_frames:
+            raise ValueError(
+                "Raw observation/action temporal mismatch before KV-cache update: "
+                f"raw_obs={len(images)}, expected_video_F={expected_video_frames}, "
+                f"action_F={action_model_input.shape[2]}, "
+                f"prepend_initial_action={prepend_initial_action}"
+            )
+
+        # All protocol checks above are side-effect free. Only now may the
+        # streaming VAE and prediction cache advance.
         latent_model_input = self._encode_obs(obs)
+        if latent_model_input is None:
+            raise ValueError("KV-cache update requires at least one observation")
         if self.frame_st_id == 0:
             latent_model_input = torch.cat(
                 [self.init_latent, latent_model_input],
-                dim=2) if latent_model_input is not None else self.init_latent
-
-        action_model_input = self.preprocess_action(obs['state'])
+                dim=2)
+        if latent_model_input.shape[0] != action_model_input.shape[0] or (
+            latent_model_input.shape[2] != action_model_input.shape[2]
+        ):
+            raise ValueError(
+                "Video/action temporal mismatch in KV cache: "
+                f"video={tuple(latent_model_input.shape)}, "
+                f"action={tuple(action_model_input.shape)}, "
+                f"prepend_initial_action={prepend_initial_action}"
+            )
+        self.transformer.clear_pred_cache(self.cache_name)
+        if self.save_debug_artifacts:
+            save_async(
+                images, os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt')
+            )
         action_model_input = action_model_input.to(latent_model_input)
         logger.info(
             f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
@@ -607,11 +725,23 @@ class VA_Server:
     def infer(self, obs):
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
+        prime = obs.get('prime', False)
         compute_kv_cache = obs.get('compute_kv_cache', False)
+        operation_count = sum(bool(value) for value in (reset, prime, compute_kv_cache))
+        if operation_count > 1:
+            raise ValueError(
+                "reset, prime, and compute_kv_cache are mutually exclusive"
+            )
+        if not reset and not self.session_initialized:
+            raise RuntimeError("Reset the LingBot server before inference")
 
         if reset:
             logger.info(f"******************* Reset server ******************")
             self._reset(prompt=prompt)
+            return dict()
+        elif prime:
+            logger.info(f"################# Prime Initial Observation #################")
+            self._prime(obs)
             return dict()
         elif compute_kv_cache:
             logger.info(
@@ -675,8 +805,57 @@ class VA_Server:
         export_to_video(decoded_video, os.path.join(self.save_root, "demo.mp4"), fps=10)
 
 def run(args):    
-    
-    config = VA_CONFIGS[args.config_name]
+    config = deepcopy(VA_CONFIGS[args.config_name])
+    if args.pretrained_model is not None:
+        config.wan22_pretrained_model_name_or_path = os.path.abspath(
+            os.path.expanduser(args.pretrained_model)
+        )
+    model_root = os.path.abspath(
+        os.path.expanduser(config.wan22_pretrained_model_name_or_path)
+    )
+    required_components = ("transformer", "vae", "tokenizer", "text_encoder")
+    missing_components = [
+        name for name in required_components
+        if not os.path.isdir(os.path.join(model_root, name))
+    ]
+    if missing_components:
+        raise FileNotFoundError(
+            f"Invalid LingBot-VA base model at {model_root}; missing "
+            f"directories: {missing_components}"
+        )
+    config.wan22_pretrained_model_name_or_path = model_root
+
+    if args.config_name == "robomme":
+        norm_stat_path = args.norm_stat_path or getattr(config, "norm_stat_path", None)
+        if not norm_stat_path:
+            raise ValueError(
+                "RoboMME inference requires normalization stats. Use "
+                "--norm-stat-path or set LINGBOT_ROBOMME_NORM_STAT."
+            )
+        config.norm_stat = load_robomme_norm_stat(norm_stat_path)
+        config.norm_stat = validate_robomme_norm_stat(
+            config.norm_stat,
+            source=norm_stat_path,
+        )
+        config.norm_stat_path = os.path.abspath(os.path.expanduser(norm_stat_path))
+
+    adapter_path = args.lora_adapter or getattr(config, "lora_adapter_path", None)
+    if adapter_path:
+        config.lora_adapter_path = str(resolve_lora_adapter_dir(adapter_path))
+    config.require_lora = bool(
+        args.require_lora or getattr(config, "require_lora", False)
+    )
+    if config.require_lora and not adapter_path:
+        raise ValueError("--require-lora was set but no LoRA adapter was provided")
+    config.save_debug_artifacts = bool(
+        args.save_debug_artifacts
+        or getattr(config, "save_debug_artifacts", False)
+    )
+    if args.action_num_inference_steps is not None:
+        if args.action_num_inference_steps <= 0:
+            raise ValueError("--action-num-inference-steps must be positive")
+        config.action_num_inference_steps = args.action_num_inference_steps
+
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
@@ -716,11 +895,42 @@ def main():
         help='(start) port'
     )
     parser.add_argument(
+        "--save-root",
         "--save_root",
+        dest="save_root",
         type=str,
         default=None,
         help='save root'
     )
+    parser.add_argument(
+        "--pretrained-model",
+        type=str,
+        default=None,
+        help="LingBot-VA base directory containing transformer/ and VAE components",
+    )
+    parser.add_argument(
+        "--norm-stat-path",
+        type=str,
+        default=None,
+        help="Required RoboMME normalization-stat JSON",
+    )
+    parser.add_argument(
+        "--lora-adapter",
+        type=str,
+        default=None,
+        help="LoRA checkpoint root or its lora_adapter directory",
+    )
+    parser.add_argument(
+        "--require-lora",
+        action="store_true",
+        help="Fail instead of serving the unadapted base model",
+    )
+    parser.add_argument(
+        "--save-debug-artifacts",
+        action="store_true",
+        help="Save per-chunk observations, actions, and latents (large)",
+    )
+    parser.add_argument("--action-num-inference-steps", type=int, default=None)
     args = parser.parse_args()
     run(args)
     logger.info("Finish all process!!!!!!!!!!!!")

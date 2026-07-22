@@ -269,13 +269,18 @@ class LatentLeRobotDataset(LeRobotDataset):
             left_action = get_relative_pose(action[:, :7])
             right_action = get_relative_pose(action[:, 8:15])
             action = np.concatenate([left_action, action[:, 7:8], right_action, action[:, 15:16]], axis=1)
-        action = np.pad(action, pad_width=((frame_stride * 4, 0), (0, 0)), mode='constant', constant_values=0)
+        prefix_action_num = frame_stride * 4
+        action = np.pad(action, pad_width=((prefix_action_num, 0), (0, 0)), mode='constant', constant_values=0)
 
         latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1
         required_action_num = latent_frame_num * frame_stride * 4
 
         action = action[:required_action_num]
         action_mask = np.ones_like(action, dtype='bool')
+        if getattr(self.config, "initial_action_condition", None) == "model_zero":
+            # F0 is a non-executed BOS condition. Mask it before normalization
+            # so asymmetric physical statistics cannot turn it into an extreme.
+            action_mask[:prefix_action_num] = False
         assert action.shape[0] == required_action_num
 
 
@@ -290,6 +295,11 @@ class LatentLeRobotDataset(LeRobotDataset):
         action_aligned = rearrange(action_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
         action_mask_aligned = rearrange(action_mask_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
         action_aligned *= action_mask_aligned
+        if getattr(self.config, "initial_action_condition", None) == "model_zero":
+            if np.any(action_aligned[:, 0]) or np.any(action_mask_aligned[:, 0]):
+                raise AssertionError(
+                    "Initial action condition must be normalized zero and masked"
+                )
         return torch.from_numpy(action_aligned).float(), torch.from_numpy(action_mask_aligned).bool()
 
     def __getitem__(self, idx) -> dict:

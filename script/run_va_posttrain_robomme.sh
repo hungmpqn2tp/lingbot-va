@@ -9,6 +9,13 @@ cd "${REPO_ROOT}"
 : "${DATASET_PATH:?Set DATASET_PATH=/path/to/prepared/robomme_data_lingbot}"
 : "${PRETRAINED_MODEL:?Set PRETRAINED_MODEL=/path/to/lingbot-va-base}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+NORM_STAT_PATH="${NORM_STAT_PATH:-${DATASET_PATH}/meta/lingbot_va_robomme_norm_stats.json}"
+RUN_DATA_CHECK="${RUN_DATA_CHECK:-0}"
+EXPECTED_EPISODES="${EXPECTED_EPISODES:-1600}"
+EXPECTED_SEGMENTS="${EXPECTED_SEGMENTS:-1600}"
+EXPECTED_FRAMES="${EXPECTED_FRAMES:-768897}"
+EXPECTED_TASKS="${EXPECTED_TASKS:-116}"
+EXPECTED_LATENT_FILES="${EXPECTED_LATENT_FILES:-3200}"
 
 if [[ "${PRETRAINED_MODEL}" == /path/to/* ]]; then
   echo "PRETRAINED_MODEL is still a placeholder: ${PRETRAINED_MODEL}" >&2
@@ -22,13 +29,34 @@ if [[ ! -f "${PRETRAINED_MODEL}/transformer/config.json" ]]; then
   exit 2
 fi
 
-"${PYTHON_BIN}" tools/check_wanva_env.py
+if [[ ! -f "${NORM_STAT_PATH}" ]]; then
+  echo "Missing RoboMME normalization stats: ${NORM_STAT_PATH}" >&2
+  exit 2
+fi
+
+"${PYTHON_BIN}" tools/check_wanva_env.py --strict
+if [[ "${RUN_DATA_CHECK}" == "1" ]]; then
+  "${PYTHON_BIN}" tools/check_robomme_lingbot.py \
+    --dataset-root "${DATASET_PATH}" \
+    --cam-keys image,wrist_image \
+    --require-norm-stats \
+    --require-latents \
+    --check-actions \
+    --verify-norm-stats \
+    --expect-binary-gripper \
+    --expect-episodes "${EXPECTED_EPISODES}" \
+    --expect-segments "${EXPECTED_SEGMENTS}" \
+    --expect-frames "${EXPECTED_FRAMES}" \
+    --expect-tasks "${EXPECTED_TASKS}" \
+    --expect-latent-files "${EXPECTED_LATENT_FILES}" \
+    --require-full-latent-frames
+fi
 
 NGPU="${NGPU:-1}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 LOG_RANK="${LOG_RANK:-0}"
 CONFIG_NAME="${CONFIG_NAME:-robomme_train}"
-TRAIN_MODE="${TRAIN_MODE:-full}"
+TRAIN_MODE="${TRAIN_MODE:-lora}"
 SAVE_ROOT="${SAVE_ROOT:-./train_out/robomme_${TRAIN_MODE}}"
 
 export TOKENIZERS_PARALLELISM=false
@@ -43,6 +71,7 @@ PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
   --config-name "${CONFIG_NAME}" \
   --dataset-path "${DATASET_PATH}" \
   --pretrained-model "${PRETRAINED_MODEL}" \
+  --norm-stat-path "${NORM_STAT_PATH}" \
   --save-root "${SAVE_ROOT}" \
   --train-mode "${TRAIN_MODE}" \
   --disable-wandb \
