@@ -61,7 +61,7 @@ SAVE_ROOT="${SAVE_ROOT:-./train_out/robomme_${TRAIN_MODE}}"
 
 export TOKENIZERS_PARALLELISM=false
 
-PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
+PYTORCH_ALLOC_CONF="expandable_segments:True" \
 "${PYTHON_BIN}" -m torch.distributed.run \
   --nproc_per_node="${NGPU}" \
   --local-ranks-filter="${LOG_RANK}" \

@@ -10,6 +10,7 @@ import wandb
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.distributed.elastic.multiprocessing.errors import record
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from torch.distributed.checkpoint.state_dict import (
@@ -77,6 +78,9 @@ class Trainer:
         self.device = torch.device(f"cuda:{config.local_rank}")
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
+        self.train_mode = getattr(config, 'train_mode', 'full').lower()
+        if self.train_mode not in {'full', 'lora'}:
+            raise ValueError(f"Unknown train_mode: {self.train_mode}")
 
         # Load models
         logger.info("Loading models...")
@@ -91,14 +95,23 @@ class Trainer:
         else:
             transformer_path = os.path.join(config.wan22_pretrained_model_name_or_path, 'transformer')
 
+        # Adapter training never updates the base weights. Keep the BF16 base
+        # in its checkpoint dtype instead of expanding it to FP32 in every
+        # rank before FSDP (about 9.5 vs 19 GiB per rank for LingBot-VA).
+        transformer_load_dtype = (
+            self.dtype if self.train_mode == 'lora' else torch.float32
+        )
+        logger.info(
+            f"Loading transformer as {transformer_load_dtype} for "
+            f"train_mode={self.train_mode}"
+        )
         self.transformer = load_transformer(
             transformer_path,
-            torch_dtype=torch.float32,
+            torch_dtype=transformer_load_dtype,
             torch_device='cpu',
             attn_mode="flex"
         )
 
-        self.train_mode = getattr(config, 'train_mode', 'full').lower()
         self.lora_matched_modules = []
         if self.train_mode == 'lora':
             target_modules = list(getattr(config, 'lora_target_modules', []))
@@ -737,6 +750,7 @@ def run(args):
     trainer.train()
 
 
+@record
 def main():
     """Parse arguments and run training."""
     parser = argparse.ArgumentParser(description="Train WAN model for robotics")

@@ -16,7 +16,8 @@ va_robomme_train_cfg.empty_emb_path = os.environ.get(
 )
 
 va_robomme_train_cfg.enable_wandb = False
-va_robomme_train_cfg.load_worker = 8
+# This value is per rank; 2 means 16 DataLoader workers on an 8-GPU run.
+va_robomme_train_cfg.load_worker = 2
 va_robomme_train_cfg.save_interval = 1000
 va_robomme_train_cfg.gc_interval = 50
 va_robomme_train_cfg.cfg_prob = 0.1

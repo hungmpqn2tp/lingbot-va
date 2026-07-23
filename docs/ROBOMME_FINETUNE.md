@@ -109,6 +109,21 @@ Keep two environments separate:
   diffusers 0.36.x, and transformers 4.55.x.
 - RoboMME benchmark: its Python 3.11+ `uv` environment.
 
+The commands below use this exact AutoDL server layout:
+
+```text
+/root/autodl-tmp/lingbot-va
+/root/autodl-tmp/lingbot-va-base
+/root/autodl-tmp/robomme_benchmark
+/root/autodl-tmp/robomme_data_lerobot
+/root/autodl-tmp/robomme_data_lingbot
+```
+
+They assume the LingBot Python executable is
+`/root/miniconda3/envs/wanva/bin/python`. If the conda environment is stored
+elsewhere, change only `PYTHON_BIN`; the project and dataset paths remain the
+same.
+
 ### 1. Full Data Check
 
 Run this once from the LingBot repo before training. It checks every Parquet
@@ -116,9 +131,9 @@ action, recomputes q01/q99, loads every camera latent, checks tensor finiteness
 and temporal metadata, and requires the official full-dataset counts.
 
 ```bash
-cd /path/to/lingbot-va
-export PYTHON_BIN=/path/to/conda/envs/wanva/bin/python
-export DATASET_PATH=/path/to/robomme_data_lingbot
+cd /root/autodl-tmp/lingbot-va
+export PYTHON_BIN=/root/miniconda3/envs/wanva/bin/python
+export DATASET_PATH=/root/autodl-tmp/robomme_data_lingbot
 
 "$PYTHON_BIN" tools/check_wanva_env.py --strict
 
@@ -151,15 +166,15 @@ conditioning or streaming path. This command has effective global batch size
 `8 * 1 * 4 = 32` and saves candidates every 500 optimizer steps.
 
 ```bash
-cd /path/to/lingbot-va
-export PYTHON_BIN=/path/to/conda/envs/wanva/bin/python
-export DATASET_PATH=/path/to/robomme_data_lingbot
-export PRETRAINED_MODEL=/path/to/lingbot-va-base
+cd /root/autodl-tmp/lingbot-va
+export PYTHON_BIN=/root/miniconda3/envs/wanva/bin/python
+export DATASET_PATH=/root/autodl-tmp/robomme_data_lingbot
+export PRETRAINED_MODEL=/root/autodl-tmp/lingbot-va-base
 export NORM_STAT_PATH="${DATASET_PATH}/meta/lingbot_va_robomme_norm_stats.json"
 export TRAIN_MODE=lora
 export NGPU=8
 export MASTER_PORT=29501
-export SAVE_ROOT=/path/to/output/robomme_lora_r16_a32
+export SAVE_ROOT=/root/autodl-tmp/lingbot-va/train_out/robomme_lora_r16_a32
 
 bash script/run_va_posttrain_robomme.sh \
   --lora-rank 16 \
@@ -170,7 +185,7 @@ bash script/run_va_posttrain_robomme.sh \
   --gradient-accumulation-steps 4 \
   --num-steps 3000 \
   --save-interval 500 \
-  --load-worker 8
+  --load-worker 2
 ```
 
 Set `RUN_DATA_CHECK=1` on this command only if the explicit full check was not
@@ -184,11 +199,11 @@ model. The server now validates and merges that adapter into the unsharded base
 model before FSDP. `--require-lora` prevents silently evaluating the base.
 
 ```bash
-cd /path/to/lingbot-va
-export PYTHON_BIN=/path/to/conda/envs/wanva/bin/python
-export PRETRAINED_MODEL=/path/to/lingbot-va-base
-export NORM_STAT_PATH=/path/to/robomme_data_lingbot/meta/lingbot_va_robomme_norm_stats.json
-export CHECKPOINT_ROOT=/path/to/output/robomme_lora_r16_a32/checkpoints/checkpoint_step_500
+cd /root/autodl-tmp/lingbot-va
+export PYTHON_BIN=/root/miniconda3/envs/wanva/bin/python
+export PRETRAINED_MODEL=/root/autodl-tmp/lingbot-va-base
+export NORM_STAT_PATH=/root/autodl-tmp/robomme_data_lingbot/meta/lingbot_va_robomme_norm_stats.json
+export CHECKPOINT_ROOT=/root/autodl-tmp/lingbot-va/train_out/robomme_lora_r16_a32/checkpoints/checkpoint_step_500
 export CONFIG_NAME=robomme
 export NGPU=8
 export MASTER_PORT=29502
@@ -200,7 +215,7 @@ bash script/run_launch_va_server_sync.sh \
   --lora-adapter "$CHECKPOINT_ROOT" \
   --require-lora \
   --action-num-inference-steps 50 \
-  --save-root /path/to/output/robomme_eval_server
+  --save-root /root/autodl-tmp/lingbot-va/train_out/robomme_eval_server_s0500
 ```
 
 The adapter argument may point either at `checkpoint_step_N/` or directly at
@@ -216,7 +231,7 @@ the complete demonstration video, caches one observation per executed action,
 and forwards the same thresholded gripper commands that were executed.
 
 ```bash
-cd /path/to/robomme_benchmark
+cd /root/autodl-tmp/robomme_benchmark
 uv sync --group server
 uv run python -m challenge_interface.scripts.deploy_lingbot \
   --transport websocket \
@@ -237,7 +252,7 @@ ID can silently reuse old results.
 
 ```bash
 # Smoke test: one episode for each benchmark task.
-cd /path/to/robomme_benchmark
+cd /root/autodl-tmp/robomme_benchmark
 uv run python -m challenge_interface.scripts.phase1_eval \
   --transport websocket \
   --host 127.0.0.1 \
