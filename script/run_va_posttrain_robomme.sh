@@ -6,6 +6,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
+# Keep caches and temporary runtime/build files off AutoDL's small root disk.
+LINGBOT_CACHE_ROOT="${LINGBOT_CACHE_ROOT:-${REPO_ROOT}/.cache}"
+LINGBOT_TMP_ROOT="${LINGBOT_TMP_ROOT:-${REPO_ROOT}/.tmp}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${LINGBOT_CACHE_ROOT}}"
+export HF_HOME="${HF_HOME:-${LINGBOT_CACHE_ROOT}/huggingface}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HUB_CACHE}}"
+export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-${HF_HOME}/lerobot}"
+export TORCH_HOME="${TORCH_HOME:-${LINGBOT_CACHE_ROOT}/torch}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${LINGBOT_CACHE_ROOT}/triton}"
+export TMPDIR="${TMPDIR:-${LINGBOT_TMP_ROOT}}"
+export TMP="${TMPDIR}"
+export TEMP="${TMPDIR}"
+mkdir -p \
+  "${HF_DATASETS_CACHE}" \
+  "${HF_HUB_CACHE}" \
+  "${HF_LEROBOT_HOME}" \
+  "${TORCH_HOME}" \
+  "${TRITON_CACHE_DIR}" \
+  "${TMPDIR}"
+
 : "${DATASET_PATH:?Set DATASET_PATH=/path/to/prepared/robomme_data_lingbot}"
 : "${PRETRAINED_MODEL:?Set PRETRAINED_MODEL=/path/to/lingbot-va-base}"
 PYTHON_BIN="${PYTHON_BIN:-python}"

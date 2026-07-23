@@ -21,6 +21,9 @@ va_robomme_train_cfg.load_worker = 2
 va_robomme_train_cfg.save_interval = 1000
 va_robomme_train_cfg.gc_interval = 50
 va_robomme_train_cfg.cfg_prob = 0.1
+# RoboMME training consumes only the 8-D action column from each Parquet file.
+# Read it directly instead of duplicating embedded images in an Arrow cache.
+va_robomme_train_cfg.load_actions_direct_from_parquet = True
 
 # Training parameters
 va_robomme_train_cfg.learning_rate = 1e-5

@@ -46,8 +46,8 @@ def construct_lerobot_multi_processor(config,
         config=config,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
-    repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
-    if num_init_worker <= 1:
+    repo_list = sorted(v.split('/meta/info.json')[0] for v in repo_list)
+    if num_init_worker <= 1 or len(repo_list) <= 1:
         return [construct_func(repo_id) for repo_id in repo_list]
 
     with Pool(num_init_worker) as pool:
@@ -120,6 +120,11 @@ class LatentLeRobotDataset(LeRobotDataset):
     ):
         self.repo_id = repo_id
         self.root = HF_LEROBOT_HOME / repo_id
+        self.config = config
+        self.action_key = getattr(config, 'action_key', 'action')
+        self.load_actions_direct_from_parquet = bool(
+            getattr(config, 'load_actions_direct_from_parquet', False)
+        )
         self.image_transforms = None
         self.delta_timestamps = None
         self.episodes = None
@@ -139,24 +144,38 @@ class LatentLeRobotDataset(LeRobotDataset):
             episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
             self.stats = aggregate_stats(episodes_stats)
         
-        try:
-            assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
-            self.hf_dataset = self.load_hf_dataset()
-        except (AssertionError, FileNotFoundError, NotADirectoryError):
-            self.revision = get_safe_version(self.repo_id, self.revision)
-            self.download_episodes(download_videos)
-            self.hf_dataset = self.load_hf_dataset()
+        if self.load_actions_direct_from_parquet:
+            missing_data_files = [
+                self.root / self.meta.get_data_file_path(episode_index)
+                for episode_index in sorted(self.meta.episodes)
+                if not (
+                    self.root / self.meta.get_data_file_path(episode_index)
+                ).is_file()
+            ]
+            if missing_data_files:
+                raise FileNotFoundError(
+                    f"Missing {len(missing_data_files)} episode Parquet files; "
+                    f"first missing file: {missing_data_files[0]}"
+                )
+            self.hf_dataset = None
+            self._direct_action_cache = {}
+        else:
+            try:
+                assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
+                self.hf_dataset = self.load_hf_dataset()
+            except (AssertionError, FileNotFoundError, NotADirectoryError):
+                self.revision = get_safe_version(self.repo_id, self.revision)
+                self.download_episodes(download_videos)
+                self.hf_dataset = self.load_hf_dataset()
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
         
         self.latent_path = Path(repo_id) / 'latents'
         self.empty_emb = torch.load(config.empty_emb_path, weights_only=False)
-        self.config = config
         self.cfg_prob = config.cfg_prob
         self.used_video_keys = config.obs_cam_keys
-        self.action_key = getattr(config, 'action_key', 'action')
         self.q01 = np.array(config.norm_stat['q01'], dtype='float')[None]
         self.q99 = np.array(config.norm_stat['q99'], dtype='float')[None]
-        self._hf_torch_view = self.hf_dataset.with_format(
+        self._hf_torch_view = None if self.hf_dataset is None else self.hf_dataset.with_format(
                 type='torch',
                 columns=[self.action_key],
                 output_all_columns=False
@@ -202,7 +221,62 @@ class LatentLeRobotDataset(LeRobotDataset):
         ep_start = self.episode_data_index["from"][episode_index]
         return local_index + ep_start
 
-    def _get_range_hf_data(self, start_frame, end_frame):
+    def _load_episode_actions(self, episode_index):
+        actions = self._direct_action_cache.get(episode_index)
+        if actions is not None:
+            return actions
+
+        import pyarrow.parquet as pq
+
+        parquet_path = self.root / self.meta.get_data_file_path(episode_index)
+        try:
+            table = pq.read_table(parquet_path, columns=[self.action_key])
+            actions = np.asarray(
+                table[self.action_key].to_pylist(),
+                dtype=np.float32,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to read action column {self.action_key!r} "
+                f"from {parquet_path}"
+            ) from exc
+
+        expected_length = int(self.meta.episodes[episode_index]["length"])
+        expected_dim = int(getattr(self.config, "action_source_dim", actions.shape[-1]))
+        if actions.ndim != 2:
+            raise ValueError(
+                f"Expected 2-D actions in {parquet_path}, got shape {actions.shape}"
+            )
+        if actions.shape != (expected_length, expected_dim):
+            raise ValueError(
+                f"Expected actions with shape ({expected_length}, {expected_dim}) "
+                f"in {parquet_path}, got {actions.shape}"
+            )
+        if not np.isfinite(actions).all():
+            raise ValueError(f"Non-finite actions found in {parquet_path}")
+
+        actions = np.ascontiguousarray(actions)
+        self._direct_action_cache[episode_index] = actions
+        return actions
+
+    def _get_range_hf_data(
+        self,
+        start_frame,
+        end_frame,
+        episode_index=None,
+    ):
+        if self._hf_torch_view is None:
+            if episode_index is None:
+                raise ValueError("episode_index is required for direct action loading")
+            actions = self._load_episode_actions(episode_index)
+            if not 0 <= start_frame < end_frame <= len(actions):
+                raise IndexError(
+                    f"Invalid action range [{start_frame}:{end_frame}] for "
+                    f"episode {episode_index} with {len(actions)} frames"
+                )
+            return {
+                self.action_key: torch.from_numpy(actions[start_frame:end_frame])
+            }
         batch = self._hf_torch_view[start_frame:end_frame]
         return batch
 
@@ -314,10 +388,16 @@ class LatentLeRobotDataset(LeRobotDataset):
         ori_data_dict = self._get_range_latent_data(start_frame, end_frame, episode_index)
 
         latent_frame_ids = ori_data_dict[f"{self.used_video_keys[0]}.frame_ids"]
-        start_frame = self._get_global_idx(episode_index, start_frame)
-        end_frame = self._get_global_idx(episode_index, end_frame)
-
-        hf_data_frames = self._get_range_hf_data(start_frame, end_frame)
+        if self._hf_torch_view is None:
+            hf_data_frames = self._get_range_hf_data(
+                local_start_frame,
+                local_end_frame,
+                episode_index=episode_index,
+            )
+        else:
+            start_frame = self._get_global_idx(episode_index, start_frame)
+            end_frame = self._get_global_idx(episode_index, end_frame)
+            hf_data_frames = self._get_range_hf_data(start_frame, end_frame)
         ori_data_dict.update(hf_data_frames)
         out_dict = self._cat_video_latents(ori_data_dict)
 
