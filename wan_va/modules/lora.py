@@ -225,7 +225,7 @@ def merge_lora_adapter_into_model(model, adapter_path):
             )
         if a_weight.shape[1] != module.in_features or b_weight.shape[0] != module.out_features:
             raise ValueError(
-                f"LoRA/base shape mismatch for {name}: A={tuple(a_weight.shape)}, "
+                f"LoRA/base shape mismatch for {name}: A={tuple(a_weight.shape)}, "z
                 f"B={tuple(b_weight.shape)}, base={tuple(module.weight.shape)}"
             )
 
