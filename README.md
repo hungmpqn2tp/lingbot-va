@@ -380,6 +380,8 @@ For better training performance, use a larger global batch size (e.g., 32, 64). 
 
 RoboMME LeRobot alignment, latent extraction, LoRA fine-tuning, and full
 fine-tuning are documented in [docs/ROBOMME_FINETUNE.md](docs/ROBOMME_FINETUNE.md).
+For copy-paste AutoDL training, evaluation, and video-decoding commands, see
+[docs/AUTODL_ROBOMME_COMMANDS.md](docs/AUTODL_ROBOMME_COMMANDS.md).
 
 
 ---
