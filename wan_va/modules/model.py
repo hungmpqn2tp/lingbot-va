@@ -99,13 +99,14 @@ class FlexAttnFunc(nn.Module):
     @staticmethod
     @torch.no_grad()
     def init_mask(
-        latent_shape, 
-        action_shape, 
-        padded_length, 
+        latent_shape,
+        action_shape,
+        padded_length,
         chunk_size,
         window_size,
         patch_size,
         device,
+        frame_valid_mask=None,
     ):
         torch._inductor.config.realize_opcount_threshold = 100
         B, _, L_F, L_H, L_W = latent_shape
@@ -133,7 +134,16 @@ class FlexAttnFunc(nn.Module):
         frame_ids = F.pad(frame_ids, (0, padded_length), value=-1)
         noise_ids = F.pad(noise_ids, (0, padded_length), value=-1)
 
-        mask_mod = FlexAttnFunc._get_mask_mod(seq_ids.long().to(device), frame_ids.long().to(device), noise_ids.long().to(device), window_size)
+        valid = None
+        if frame_valid_mask is not None:
+            frame_valid_mask = frame_valid_mask.to(device)
+            latent_frame_valid = frame_valid_mask[:, :, None, None].expand(
+                -1, -1, L_H // patch_size[1], L_W // patch_size[2]).flatten()
+            action_frame_valid = frame_valid_mask[:, :, None, None].expand(-1, -1, A_H, A_W).flatten()
+            valid = torch.cat([latent_frame_valid] * 2 + [action_frame_valid] * 2)
+            valid = F.pad(valid, (0, padded_length), value=False)
+
+        mask_mod = FlexAttnFunc._get_mask_mod(seq_ids.long().to(device), frame_ids.long().to(device), noise_ids.long().to(device), window_size, valid)
         block_mask = FlexAttnFunc.compiled_create_block_mask(
                 mask_mod, 1, 1, len(seq_ids), len(seq_ids), device=device, _compile=True
             )
@@ -157,7 +167,7 @@ class FlexAttnFunc(nn.Module):
     
     @staticmethod
     @torch.no_grad()
-    def _get_mask_mod(seq_ids, frame_ids, noise_ids, window_size):
+    def _get_mask_mod(seq_ids, frame_ids, noise_ids, window_size, valid=None):
         def seq_mask(
             b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
         ):
@@ -204,6 +214,12 @@ class FlexAttnFunc(nn.Module):
         mask = or_masks(*mask_list)
         mask = and_masks(mask, seq_mask)
         mask = and_masks(mask, partial(block_window_mask, window_size=window_size))
+        if valid is not None:
+            def valid_token_mask(
+                b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+            ):
+                return valid[q_idx] & valid[kv_idx]
+            mask = and_masks(mask, valid_token_mask)
         return mask
        
 class WanTimeTextImageEmbedding(nn.Module):
@@ -771,13 +787,14 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                       condition_action_hidden_states.shape[1],
                       padded_length]
 
-        FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
-                               action_dict['noisy_latents'].shape, 
-                               padded_length, 
+        FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape,
+                               action_dict['noisy_latents'].shape,
+                               padded_length,
                                input_dict["chunk_size"],
                                window_size=input_dict['window_size'],
                                patch_size=self.patch_size,
-                               device=hidden_states.device
+                               device=hidden_states.device,
+                               frame_valid_mask=latent_dict.get('frame_valid_mask'),
                                )
 
         for block in self.blocks:

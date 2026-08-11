@@ -10,6 +10,7 @@ from tqdm import tqdm
 from multiprocessing import Pool
 from functools import partial
 import torch
+import torch.nn.functional as nnf
 from einops import rearrange
 from torch.utils.data import DataLoader
 from scipy.spatial.transform import Rotation as R
@@ -408,6 +409,39 @@ class LatentLeRobotDataset(LeRobotDataset):
 
     def __len__(self):
         return len(self.new_metas)
+
+
+def pad_collate_fn(batch):
+    """Pad variable-length latents/actions to the batch's max frame count.
+
+    Each sample's 'latents' (C,F,H,W) and 'actions'/'actions_mask' (30,F,N,1)
+    have a variable F (RoboMME episode/segment length). Zero-pad every sample
+    to F_max on the frame axis and emit 'frame_valid_mask' (B,F_max) bool
+    (True=real frame, False=padding) so the loss and attention mask can
+    exclude padded frames. actions_mask is padded with False, which the
+    existing action-loss masking in train.py's compute_loss already respects
+    unchanged.
+    """
+    f_max = max(item['latents'].shape[1] for item in batch)
+    latents, actions, actions_masks, text_embs, frame_valid_masks = [], [], [], [], []
+    for item in batch:
+        f = item['latents'].shape[1]
+        pad_f = f_max - f
+        latents.append(nnf.pad(item['latents'], (0, 0, 0, 0, 0, pad_f)))
+        actions.append(nnf.pad(item['actions'], (0, 0, 0, 0, 0, pad_f)))
+        actions_masks.append(nnf.pad(item['actions_mask'], (0, 0, 0, 0, 0, pad_f), value=False))
+        text_embs.append(item['text_emb'])
+        mask = torch.zeros(f_max, dtype=torch.bool)
+        mask[:f] = True
+        frame_valid_masks.append(mask)
+    return {
+        'latents': torch.stack(latents),
+        'actions': torch.stack(actions),
+        'actions_mask': torch.stack(actions_masks),
+        'text_emb': torch.stack(text_embs),
+        'frame_valid_mask': torch.stack(frame_valid_masks),
+    }
+
 
 if __name__ == '__main__':
     from wan_va.configs import VA_CONFIGS

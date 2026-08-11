@@ -103,17 +103,42 @@ def _segments_from_column(dataset_root, info, episode, column, min_frames):
     return _merge_short_segments(segments, min_frames)
 
 
-def build_action_config(dataset_root, info, episode, segment_source, min_segment_frames):
+def _segments_fixed_window(episode, window_frames, window_stride, min_frames):
+    length = int(episode["length"])
+    default_text = _task_text(episode)
+    if length <= window_frames:
+        return [{"start_frame": 0, "end_frame": length, "action_text": default_text}]
+    segments = []
+    start = 0
+    while start < length:
+        end = min(start + window_frames, length)
+        segments.append({"start_frame": start, "end_frame": end, "action_text": default_text})
+        if end >= length:
+            break
+        start += window_stride
+    return _merge_short_segments(segments, min_frames)
+
+
+def build_action_config(dataset_root, info, episode, segment_source, min_segment_frames,
+                         window_frames=None, window_stride=None):
     length = int(episode["length"])
     if segment_source == "task":
         return [{"start_frame": 0, "end_frame": length, "action_text": _task_text(episode)}]
-    segments = _segments_from_column(
-        dataset_root,
-        info,
-        episode,
-        segment_source,
-        min_segment_frames,
-    )
+    if segment_source == "fixed-window":
+        segments = _segments_fixed_window(
+            episode,
+            window_frames,
+            window_stride or window_frames,
+            min_segment_frames,
+        )
+    else:
+        segments = _segments_from_column(
+            dataset_root,
+            info,
+            episode,
+            segment_source,
+            min_segment_frames,
+        )
     out = []
     for segment in segments:
         start = max(0, min(int(segment["start_frame"]), length))
@@ -219,6 +244,8 @@ def prepare(args):
             episode,
             args.segment_source,
             args.min_segment_frames,
+            args.window_frames,
+            args.window_stride,
         )
         prepared.append(row)
     write_jsonl(output_root / "meta" / "episodes.jsonl", prepared)
@@ -239,6 +266,8 @@ def prepare(args):
         "output_root": str(output_root),
         "segment_source": args.segment_source,
         "min_segment_frames": args.min_segment_frames,
+        "window_frames": args.window_frames,
+        "window_stride": args.window_stride,
         "action_key": args.action_key,
         "data_is_symlink": not args.copy_data,
         "episodes": len(prepared),
@@ -260,15 +289,28 @@ def main():
     parser.add_argument("--copy-data", action="store_true", help="Copy data instead of symlinking it")
     parser.add_argument(
         "--segment-source",
-        choices=("task",) + ROBO_MME_SUBGOAL_COLUMNS,
+        choices=("task", "fixed-window") + ROBO_MME_SUBGOAL_COLUMNS,
         default="task",
         help="Where action_config text/segments should come from",
     )
     parser.add_argument("--min-segment-frames", type=int, default=8)
+    parser.add_argument(
+        "--window-frames", type=int, default=None,
+        help="Fixed window length in native (raw) frames; required for --segment-source fixed-window",
+    )
+    parser.add_argument(
+        "--window-stride", type=int, default=None,
+        help="Stride in native frames between window starts; defaults to --window-frames (non-overlapping)",
+    )
     parser.add_argument("--action-key", default="actions")
     parser.add_argument("--action-source-dim", type=int, default=8)
     parser.add_argument("--compute-norm-stats", action="store_true")
     args = parser.parse_args()
+    if args.segment_source == "fixed-window":
+        if not args.window_frames or args.window_frames <= 0:
+            raise SystemExit("--window-frames must be a positive integer when --segment-source fixed-window")
+        if args.window_stride is not None and args.window_stride <= 0:
+            raise SystemExit("--window-stride must be a positive integer")
     prepare(args)
 
 

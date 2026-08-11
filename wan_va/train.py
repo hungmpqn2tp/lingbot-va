@@ -54,7 +54,7 @@ from utils import (
     FlowMatchScheduler
 )
 
-from dataset import MultiLatentLeRobotDataset
+from dataset import MultiLatentLeRobotDataset, pad_collate_fn
 import gc
 
 
@@ -181,12 +181,14 @@ class Trainer:
             shuffle=True,
             seed=42
         ) if config.world_size > 1 else None
+        collate_fn = pad_collate_fn if getattr(config, 'enable_frame_padding', False) else None
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
-            shuffle=(train_sampler is None), 
+            shuffle=(train_sampler is None),
             num_workers=config.load_worker,
             sampler=train_sampler,
+            collate_fn=collate_fn,
         )
 
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
@@ -275,13 +277,18 @@ class Trainer:
         """Prepare input dict following infer code pattern from wan_va_server.py."""
         # Generate grid_id following infer code (no batch dimension yet)
         # For action mode: get_mesh_id(shape[-3], shape[-2], shape[-1], t=1, f_w=1, f_shift, action=True)
+        frame_valid_mask = batch_dict.get('frame_valid_mask')  # None when padding disabled
+        latent_mask_broadcast = (
+            frame_valid_mask[:, None, :, None, None] if frame_valid_mask is not None else None
+        )
         latent_dict = self._add_noise(
-            latent=batch_dict['latents'], 
-            train_scheduler=self.train_scheduler_latent, 
-            action_mask=None, 
+            latent=batch_dict['latents'],
+            train_scheduler=self.train_scheduler_latent,
+            action_mask=latent_mask_broadcast,  # reused generically: any broadcastable validity mask
             action_mode=False,
             noisy_cond_prob=0.5)
-        
+        latent_dict['frame_valid_mask'] = frame_valid_mask
+
         action_dict = self._add_noise(
             latent=batch_dict['actions'], 
             train_scheduler=self.train_scheduler_action, 
@@ -337,13 +344,27 @@ class Trainer:
         # Frame-wise video loss calculation
         latent_loss = F.mse_loss(latent_pred.float(), input_dict['latent_dict']['targets'].float().detach(), reduction='none')
         latent_loss = latent_loss * latent_loss_weight[:, None, :, None, None]
+        frame_valid_mask = input_dict['latent_dict'].get('frame_valid_mask')
+        if frame_valid_mask is not None:
+            latent_frame_valid = frame_valid_mask[:, None, :, None, None].float().expand_as(latent_loss)
+        else:
+            latent_frame_valid = torch.ones_like(latent_loss)
+        latent_loss = latent_loss * latent_frame_valid
         # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
         latent_loss = latent_loss.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
+        latent_frame_valid = latent_frame_valid.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
         latent_loss = latent_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
-        # Sum per frame and compute mask per frame
+        latent_frame_valid = latent_frame_valid.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
+        # Sum per frame and normalize by mask per frame (padded frames excluded)
         latent_loss_per_frame = latent_loss.sum(dim=1)  # (B*F,)
-        latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)  # (B*F,)
-        latent_loss = (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
+        latent_mask_per_frame = latent_frame_valid.sum(dim=1)  # (B*F,)
+        valid_latent_frames = latent_mask_per_frame > 0
+        if not torch.any(valid_latent_frames):
+            raise ValueError("Batch has no valid latent target frames")
+        latent_loss = (
+            latent_loss_per_frame[valid_latent_frames]
+            / latent_mask_per_frame[valid_latent_frames]
+        ).mean()
 
         # Frame-wise action loss calculation
         action_loss = F.mse_loss(action_pred.float(), input_dict['action_dict']['targets'].float().detach(), reduction='none')

@@ -34,6 +34,11 @@ va_robomme_train_cfg.warmup_steps = 10
 va_robomme_train_cfg.batch_size = 1
 va_robomme_train_cfg.gradient_accumulation_steps = 1
 va_robomme_train_cfg.num_steps = 50000
+# RoboMME episodes have variable rollout horizons. Enable padding + a
+# frame_valid_mask (dataset collate_fn -> loss masking -> attention mask) so
+# batch_size can be raised above 1 without cropping/corrupting variable-length
+# episodes. No-op when batch_size stays 1.
+va_robomme_train_cfg.enable_frame_padding = True
 
 # Fine-tuning mode. Use "full" for standard FSDP fine-tuning or "lora" for
 # trainable low-rank adapters on top of the frozen transformer.
@@ -50,7 +55,19 @@ va_robomme_train_cfg.lora_target_modules = [
     "blocks.*.attn2.to_k",
     "blocks.*.attn2.to_v",
     "blocks.*.attn2.to_out.0",
+    # Shared FFN (largest per-layer block, used by both video and action
+    # tokens). Verify these dotted names on the training server before
+    # relying on them (diffusers.models.attention.FeedForward internals
+    # weren't inspectable in the planning environment):
+    #   for n, m in transformer.named_modules():
+    #       if isinstance(m, torch.nn.Linear) and "ffn" in n: print(n)
+    "blocks.*.ffn.net.0.proj",
+    "blocks.*.ffn.net.2",
     "action_embedder",
     "action_proj_out",
+    # Video stream's own dedicated I/O, mirroring action_embedder/action_proj_out
+    # above (previously the video stream only got adapters via shared attention).
+    "patch_embedding_mlp",
+    "proj_out",
 ]
 va_robomme_train_cfg.lora_save_merged = False
