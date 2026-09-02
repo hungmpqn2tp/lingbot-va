@@ -157,6 +157,26 @@ class Trainer:
         else:
             mark_only_lora_as_trainable(self.transformer)
 
+        self.freeze_action = bool(getattr(config, 'freeze_action', False))
+        if self.freeze_action:
+            action_prefixes = (
+                "action_embedder.",
+                "action_proj_out.",
+                "condition_embedder_action.",
+            )
+            frozen = 0
+            for name, param in self.transformer.named_parameters():
+                if name.startswith(action_prefixes):
+                    param.requires_grad_(False)
+                    frozen += 1
+            trainable, total = count_trainable_parameters(self.transformer)
+            logger.info(
+                f"freeze_action enabled: froze {frozen} action-specific parameters "
+                "(action_embedder, action_proj_out, condition_embedder_action). "
+                "action_loss is still computed for logging but no longer "
+                f"contributes gradient. Trainable now: {trainable:,} / {total:,}"
+            )
+
         # Optimizer
         self.optimizer = torch.optim.AdamW(
             [p for p in self.transformer.parameters() if p.requires_grad],
@@ -402,7 +422,8 @@ class Trainer:
 
         output = self.transformer(input_dict, train_mode=True)
         latent_loss, action_loss = self.compute_loss(input_dict, output)
-        loss = latent_loss + action_loss
+        action_weight = 0.0 if self.freeze_action else 1.0
+        loss = latent_loss + action_weight * action_loss
 
         loss.backward()
 
@@ -727,6 +748,8 @@ def _apply_cli_overrides(config, args):
         ]
     if args.lora_save_merged:
         config.lora_save_merged = True
+    if args.freeze_action:
+        config.freeze_action = True
 
     _maybe_load_norm_stat(
         config,
@@ -746,6 +769,21 @@ def _apply_cli_overrides(config, args):
             raise ValueError("LoRA alpha must be finite and positive")
         if not 0.0 <= float(config.lora_dropout) < 1.0:
             raise ValueError("LoRA dropout must be in [0, 1)")
+        if getattr(config, "freeze_action", False):
+            # Injecting a LoRA adapter and then freezing it makes
+            # save_lora_checkpoint's gathered state (ignore_frozen_params=True)
+            # disagree with the full injected-module list. Don't inject there
+            # in the first place instead of freezing after the fact.
+            skip = {"action_embedder", "action_proj_out"}
+            original = list(getattr(config, "lora_target_modules", []))
+            filtered = [pattern for pattern in original if pattern not in skip]
+            if len(filtered) != len(original):
+                logger.info(
+                    "freeze_action enabled: excluding "
+                    f"{sorted(skip & set(original))} from lora_target_modules "
+                    "so no adapter is injected there"
+                )
+            config.lora_target_modules = filtered
 
 
 def run(args):
@@ -811,6 +849,15 @@ def main():
         help="Comma-separated fnmatch patterns for Linear modules",
     )
     parser.add_argument("--lora-save-merged", action="store_true")
+    parser.add_argument(
+        "--freeze-action",
+        action="store_true",
+        help=(
+            "Freeze action_embedder/action_proj_out/condition_embedder_action "
+            "and drop action_loss's gradient contribution, so only the shared "
+            "backbone and video-side modules train on the imagination objective."
+        ),
+    )
 
     args = parser.parse_args()
     run(args)

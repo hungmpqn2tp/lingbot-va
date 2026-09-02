@@ -1,1 +1,15 @@
 *.pyc
+*_pycache_ 
+*.cache 
+*.tmp 
+debug_imagination_run/
+imagination_videos/
+eval_vis/
+train_out/
+*.egg-info/
+check_robomme_lingbot_output.txt
+
+full_train_log.txt
+train_latent_log.txt
+latent_only_loss.png
+loss.png 
